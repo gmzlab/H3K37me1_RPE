@@ -1,0 +1,231 @@
+#!/bin/bash
+
+if [ $# -ne 1 ]
+then
+	echo 'Parameters file not properly provided. Quiting...'
+	exit
+fi
+
+############################# LOADING PARAMETERS #############################
+
+echo ''
+echo 'LOADING PARAMETERS'
+
+# Working directory: absolute path to the folder containing all files.
+WD=$(grep working_directory: $1 | awk '{ print $2 }')
+# Genome folder absolute path.
+GENOME=$(grep genome_path: $1 | awk '{ print $2 }')
+# Number of processors.
+THREADS=$(grep number_processors: $1 | awk '{ print $2 }')
+# Wether reads are paired end or not.
+PAIRED_END=$(grep paired_end: $1 | awk '{ print $2 }')
+# Wether to perform FastQC analysis or not.
+FASTQC=$(grep fastqc: $1 | awk '{ print $2 }')
+# Number of samples.
+NSAMPLES=$(grep sample_ $1 | wc -l)
+# Samples names saved within an array.
+SAMPLES=()
+for i in `seq 1 $NSAMPLES`
+do
+	SAMPLES[$i]=$(grep sample_${i}: $1 | awk '{ print $2 }')
+done
+# Number of replicates per sample.
+NREP=()
+for i in `seq 1 $NSAMPLES`
+do
+	NREP[$i]=`ls --format single-column ${WD}/samples/${SAMPLES[$i]}/${SAMPLES[$i]}*.fastq.gz | wc -l`
+	if [ $PAIRED_END == 'yes' ]
+	then
+		NREP[$i]=$((${NREP[$i]}/2))
+	fi
+done
+
+############################# REPORTING PARAMETERS #############################
+
+echo ''
+echo ' - Working directory:' $WD
+echo ' - Genome folder path:' $GENOME
+echo ' - Number of processors:' $THREADS
+echo ' - Paired end:' $PAIRED_END
+echo ' - FastQC analysis:' $FASTQC
+echo ' - Number of samples:' $NSAMPLES
+echo ' - Samples names:' ${SAMPLES[@]}
+echo ' - Replicates per sample:' ${NREP[@]}
+echo ''
+
+sleep 10s
+
+echo ''
+echo 'PIPELINE RUNNING STARTED'
+INIT=`date`
+echo ''
+echo ''
+
+############################# BUILDING GENOME INDEX ############################# 
+
+#cd $GENOME
+#mkdir STAR_index
+#STAR --runThreadN $THREADS --runMode genomeGenerate --genomeDir STAR_index --genomeFastaFiles genome.fa
+
+
+############################# READ MAPPING #############################
+
+echo 'READ MAPPING'
+echo ''
+
+for i in `seq 1 $NSAMPLES`
+do
+	echo 'Processing' ${SAMPLES[$i]}':'
+	echo ''
+	cd ${WD}/samples/${SAMPLES[$i]}
+	# QUALITY CONTROL:
+	if [ $FASTQC == 'yes' ]
+	then
+		echo ${SAMPLES[$i]} 'quality control:'
+		fastqc *.fastq.gz
+		mv *fastqc* -t ../../quality_control
+		echo ''
+		echo ''
+	fi
+	
+	echo 'Gunzipping...'
+	gunzip -k ${SAMPLES[$i]}*.fastq.gz
+	
+	for j in `seq 1 ${NREP[$i]}`
+	do
+		if [ $PAIRED_END == 'yes' ]
+		then
+			STAR --runThreadN $THREADS --genomeDir $GENOME/STAR_index --readFilesIn ${SAMPLES[$i]}_${j}_1.fastq ${SAMPLES[$i]}_${j}_2.fastq --outSAMtype BAM Unsorted
+		else
+			STAR --runThreadN $THREADS --genomeDir $GENOME/STAR_index --readFilesIn ${SAMPLES[$i]}_${j}.fastq --outSAMtype BAM Unsorted
+		fi
+		# Filtering unique and high quality mapping reads:
+		# -F: exclude alignments with the given flag. FLAG 780 refers to unmapped reads, unmapped mates, secondary alignment and reads that fail platform/vendor quality checks (https://broadinstitute.github.io/picard/explain-flags.html).
+		# -q: exclude reads with mapping quality under a given value. 30 means a 0.001 probability of mismapping (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2577856/).
+		# -O: output format.
+		# -@: number of processors.
+		samtools view -F 780 -O BAM -q 30 -@ $THREADS Aligned.out.bam > ${SAMPLES[$i]}_${j}_filt.bam
+		
+		# Sorting .bam file by coordinates.
+		# -@: number of threads.
+		# -o: output file.
+		samtools sort -@ $THREADS ${SAMPLES[$i]}_${j}_filt.bam -o ${SAMPLES[$i]}_${j}.bam 
+	
+		#mv Aligned.out.bam ${SAMPLES[$i]}.bam
+	
+		# Indexing .bam file
+		samtools index -@ $THREADS ${SAMPLES[$i]}_${j}.bam
+		# Generating bigwig files
+		bamCoverage -p $THREADS -b ${SAMPLES[$i]}_${j}.bam --normalizeUsing RPKM -o ${SAMPLES[$i]}_${j}.bw -bs 50
+		#bamCoverage -p $THREADS -b ${SAMPLES[$i]}_${j}.bam --normalizeUsing RPKM -o ${SAMPLES[$i]}_${j}_fw.bw --filterRNAstrand forward
+		#bamCoverage -p $THREADS -b ${SAMPLES[$i]}_${j}.bam --normalizeUsing RPKM -o ${SAMPLES[$i]}_${j}_rv.bw --filterRNAstrand reverse
+		#bigwigCompare -p $THREADS -b1 ${SAMPLES[$i]}_${j}_fw.bw -b2 ${SAMPLES[$i]}_${j}_rv.bw --operation add -o ${SAMPLES[$i]}_${j}_sum.bw
+		
+		# Cleaning up
+		rm Aligned.out.bam ${SAMPLES[$i]}_${j}_filt.bam ${SAMPLES[$i]}_${j}*.fastq
+		
+		if [ -d ${WD}/quality_control/${SAMPLES[$i]}_${j}_STAR_logs ]
+		then
+			echo 'Moving STAR logs to' ${WD}/quality_control/${SAMPLES[$i]}_${j}_STAR_logs
+		else
+			echo 'Creating' ${WD}/quality_control/${SAMPLES[$i]}_${j}_STAR_logs 'and moving STAR logs to it'
+			mkdir ${WD}/quality_control/${SAMPLES[$i]}_${j}_STAR_logs
+		fi
+		mv Log.final.out Log.out Log.progress.out SJ.out.tab -t ${WD}/quality_control/${SAMPLES[$i]}_${j}_STAR_logs
+	done
+	
+	bigwigAverage -p $THREADS -b ${SAMPLES[$i]}_*.bw -o ${WD}/bw_files/${SAMPLES[$i]}.bw -bs 50 
+	
+	
+	echo ''
+	echo ''
+	
+done
+
+
+# Relocating mapping files
+cd ${WD}/samples
+mv */*.bam* -t ../bam_files/per_replicate
+mv */*.bw -t ../bw_files/per_replicate
+
+# Quality control summary 
+echo 'Running MultiQC...'
+cd ${WD}/quality_control
+multiqc .
+echo ''
+echo ''
+
+echo 'PIPELINE RUNNING STARTED ON'
+echo $INIT
+echo ''
+echo 'AND FINISHED ON'
+date
+echo ''
+
+exit
+
+
+###########################################################################
+
+# WHEN USING ALL SAMPLES TOGETHER
+
+
+	if [ $PAIRED_END == 'yes' ]
+	then
+	REPS1=${SAMPLES[$i]}_1_1.fastq
+	REPS2=${SAMPLES[$i]}_1_2.fastq
+	for j in `seq 2 ${NREP[$i]}`
+	do
+		REPS1=${REPS1},${SAMPLES[$i]}_${j}_1.fastq
+		REPS2=${REPS2},${SAMPLES[$i]}_${j}_2.fastq
+	done
+	STAR --runThreadN $THREADS --genomeDir $GENOME/STAR_index --readFilesIn $REPS1 $REPS2 --outSAMtype BAM Unsorted
+	
+	else
+	REPS=${SAMPLES[$i]}_1.fastq
+	for j in `seq 2 ${NREP[$i]}`
+	do
+		REPS=${REPS},${SAMPLES[$i]}_${j}.fastq
+	done
+	STAR --runThreadN $THREADS --genomeDir $GENOME/STAR_index --readFilesIn $REPS --outSAMtype BAM Unsorted
+	
+	fi
+	
+	# Filtering unique mapping reads
+	# -F: exclude alignments with the given flag. FLAG 256 refers to secondary alignments.
+	#samtools view -F 256 -O BAM -@ $THREADS Aligned.out.bam > ${SAMPLES[$i]}_smap.bam
+
+	# USING MARKDUP.
+	# Sorting .bam file by coordinates.
+	# -@: number of threads.
+	# -o: output file.
+	samtools sort -@ $THREADS Aligned.out.bam -o ${SAMPLES[$i]}.bam 
+	
+	#mv Aligned.out.bam ${SAMPLES[$i]}.bam
+	
+	# Indexing .bam file
+	samtools index -@ $THREADS ${SAMPLES[$i]}.bam
+	
+	# Generating bigwig files
+	bamCoverage -p ${THREADS} -b ${SAMPLES[$i]}.bam --normalizeUsing RPKM -o ${SAMPLES[$i]}.bw ###--filterRNAstrand
+	
+	# Cleaning up
+	#rm Aligned.out.bam ${SAMPLES[$i]}*.fastq
+	if [ -d ${WD}/quality_control/${SAMPLES[$i]}_STAR_logs ]
+	then
+		echo 'Moving STAR logs to' ${WD}/quality_control/${SAMPLES[$i]}_STAR_logs
+	else
+		echo 'Creating' ${WD}/quality_control/${SAMPLES[$i]}_STAR_logs 'and moving STAR logs to it'
+		mkdir ${WD}/quality_control/${SAMPLES[$i]}_STAR_logs
+	fi
+	mv Log.final.out  Log.out  Log.progress.out  SJ.out.tab -t ${WD}/quality_control/${SAMPLES[$i]}_STAR_logs
+	echo ''
+	echo ''
+
+
+
+
+
+
+
+
